@@ -3,16 +3,18 @@ const http = require('http');
 
 const PORT = process.env.PORT || 3001;
 
-// HTTP server - Railway needs a health check response
 const server = http.createServer((req, res) => {
+  // Railway health check + CORS
   res.writeHead(200, {
     'Content-Type': 'text/plain',
-    'Access-Control-Allow-Origin': '*'
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': '*'
   });
-  res.end('Monkey Tag Server OK');
+  res.end('Monkey Tag WS Server — OK');
 });
 
-const wss = new WebSocketServer({ server });
+// Attach WebSocket server to the same HTTP server
+const wss = new WebSocketServer({ server, perMessageDeflate: false });
 
 const lobbies = {};
 let nextId = 1;
@@ -25,13 +27,13 @@ function getLobby(id) {
 function broadcast(lobby, msg, excludeId = null) {
   const data = JSON.stringify(msg);
   Object.entries(lobby).forEach(([id, p]) => {
-    if (id !== excludeId && p.ws.readyState === 1) {
-      try { p.ws.send(data); } catch(e) {}
+    if (id !== excludeId && p.ws.readyState === WebSocket.OPEN) {
+      try { p.ws.send(data); } catch (e) { /* ignore */ }
     }
   });
 }
 
-function getLobbyState(lobby) {
+function broadcastState(lobby) {
   const players = {};
   Object.entries(lobby).forEach(([id, p]) => {
     players[id] = { name: p.name, color: p.color, x: p.x, y: p.y, z: p.z, yaw: p.yaw };
@@ -39,81 +41,94 @@ function getLobbyState(lobby) {
   return players;
 }
 
+// Use global WebSocket constant for readyState
+const { WebSocket } = require('ws');
+
 wss.on('connection', (ws, req) => {
   const id = String(nextId++);
   let lobbyId = null;
   let playerName = 'Monkey';
+  let isAlive = true;
 
-  console.log(`Client ${id} connected from ${req.socket.remoteAddress}`);
+  console.log(`[+] Client ${id} connected`);
 
-  // Keep-alive ping every 25 seconds (Railway kills idle connections)
-  const pingInterval = setInterval(() => {
-    if (ws.readyState === 1) {
-      try { ws.ping(); } catch(e) {}
+  // Keep-alive: ping every 20 seconds to prevent Railway from dropping idle connections
+  ws.on('pong', () => { isAlive = true; });
+  const heartbeat = setInterval(() => {
+    if (!isAlive) {
+      console.log(`[-] Client ${id} timed out`);
+      clearInterval(heartbeat);
+      ws.terminate();
+      return;
     }
-  }, 25000);
-
-  ws.on('pong', () => {}); // keep alive
+    isAlive = false;
+    try { ws.ping(); } catch (e) {}
+  }, 20000);
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.type === 'join') {
-      lobbyId = (msg.lobby || 'public').toLowerCase().substring(0, 20);
-      playerName = (msg.name || 'Monkey').substring(0, 16);
+      lobbyId = String(msg.lobby || 'public').toLowerCase().slice(0, 20);
+      playerName = String(msg.name || 'Monkey').slice(0, 16);
       const lobby = getLobby(lobbyId);
 
-      lobby[id] = {
-        ws,
-        name: playerName,
-        color: msg.color || 0xff6600,
-        x: 0, y: 0, z: 0, yaw: 0
-      };
+      lobby[id] = { ws, name: playerName, color: msg.color || 0xff6600, x: 0, y: 0, z: 0, yaw: 0 };
 
-      ws.send(JSON.stringify({ type: 'welcome', id }));
-      ws.send(JSON.stringify({ type: 'state', players: getLobbyState(lobby) }));
-      broadcast(lobby, { type: 'player_join', id, name: playerName, color: msg.color }, id);
+      try {
+        ws.send(JSON.stringify({ type: 'welcome', id }));
+        ws.send(JSON.stringify({ type: 'state', players: broadcastState(lobby) }));
+      } catch (e) {}
 
+      broadcast(lobby, { type: 'player_join', id, name: playerName, color: msg.color || 0xff6600 }, id);
       console.log(`[${lobbyId}] ${playerName}(${id}) joined — ${Object.keys(lobby).length} players`);
     }
 
     if (msg.type === 'move' && lobbyId) {
       const lobby = getLobby(lobbyId);
       if (lobby[id]) {
-        lobby[id].x   = typeof msg.x   === 'number' ? msg.x   : 0;
-        lobby[id].y   = typeof msg.y   === 'number' ? msg.y   : 0;
-        lobby[id].z   = typeof msg.z   === 'number' ? msg.z   : 0;
-        lobby[id].yaw = typeof msg.yaw === 'number' ? msg.yaw : 0;
-        if (msg.name) lobby[id].name = msg.name.substring(0, 16);
-        broadcast(lobby, { type: 'player_move', id, x: lobby[id].x, y: lobby[id].y, z: lobby[id].z, yaw: lobby[id].yaw, name: lobby[id].name, color: lobby[id].color }, id);
+        lobby[id].x   = +msg.x   || 0;
+        lobby[id].y   = +msg.y   || 0;
+        lobby[id].z   = +msg.z   || 0;
+        lobby[id].yaw = +msg.yaw || 0;
+        if (msg.name) lobby[id].name = String(msg.name).slice(0, 16);
+        broadcast(lobby, {
+          type: 'player_move', id,
+          x: lobby[id].x, y: lobby[id].y, z: lobby[id].z, yaw: lobby[id].yaw,
+          name: lobby[id].name, color: lobby[id].color
+        }, id);
       }
     }
   });
 
   ws.on('close', () => {
-    clearInterval(pingInterval);
+    clearInterval(heartbeat);
     if (!lobbyId) return;
     const lobby = getLobby(lobbyId);
     if (lobby[id]) {
       broadcast(lobby, { type: 'player_leave', id, name: playerName });
       delete lobby[id];
       console.log(`[${lobbyId}] ${playerName}(${id}) left — ${Object.keys(lobby).length} players`);
-      if (Object.keys(lobby).length === 0) delete lobbies[lobbyId];
+      if (Object.keys(lobby).length === 0) {
+        delete lobbies[lobbyId];
+        console.log(`[${lobbyId}] Lobby closed`);
+      }
     }
   });
 
   ws.on('error', (err) => {
-    console.error(`Client ${id} error:`, err.message);
+    console.error(`Client ${id} error: ${err.message}`);
   });
 });
 
 server.listen(PORT, '0.0.0.0', () => {
-  console.log(`Monkey Tag server listening on 0.0.0.0:${PORT}`);
+  console.log(`✅ Monkey Tag server running on port ${PORT}`);
 });
 
-// Log active lobbies every 60s
-setInterval(() => {
-  const total = Object.values(lobbies).reduce((s, l) => s + Object.keys(l).length, 0);
-  if (total > 0) console.log(`Active: ${total} players across ${Object.keys(lobbies).length} lobbies`);
-}, 60000);
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received, closing server');
+  wss.clients.forEach(c => c.close());
+  server.close(() => process.exit(0));
+});
