@@ -1,22 +1,20 @@
-// WebSocket Server for Monkey Tag Multiplayer
-// Deploy this to Railway, Render, or Fly.io (NOT Vercel - Vercel doesn't support WS)
-// Then update WS_SERVER in index.html with your deployed URL
-
 const { WebSocketServer } = require('ws');
 const http = require('http');
 
 const PORT = process.env.PORT || 3001;
 
+// HTTP server - Railway needs a health check response
 const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Monkey Tag WebSocket Server Running');
+  res.writeHead(200, {
+    'Content-Type': 'text/plain',
+    'Access-Control-Allow-Origin': '*'
+  });
+  res.end('Monkey Tag Server OK');
 });
 
 const wss = new WebSocketServer({ server });
 
-// lobbies[lobbyId] = { [playerId]: { ws, name, color, x, y, z, yaw } }
 const lobbies = {};
-
 let nextId = 1;
 
 function getLobby(id) {
@@ -26,9 +24,9 @@ function getLobby(id) {
 
 function broadcast(lobby, msg, excludeId = null) {
   const data = JSON.stringify(msg);
-  Object.entries(lobby).forEach(([id, player]) => {
-    if (id !== excludeId && player.ws.readyState === 1) {
-      player.ws.send(data);
+  Object.entries(lobby).forEach(([id, p]) => {
+    if (id !== excludeId && p.ws.readyState === 1) {
+      try { p.ws.send(data); } catch(e) {}
     }
   });
 }
@@ -41,61 +39,81 @@ function getLobbyState(lobby) {
   return players;
 }
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   const id = String(nextId++);
-  let playerLobbyId = null;
+  let lobbyId = null;
   let playerName = 'Monkey';
+
+  console.log(`Client ${id} connected from ${req.socket.remoteAddress}`);
+
+  // Keep-alive ping every 25 seconds (Railway kills idle connections)
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === 1) {
+      try { ws.ping(); } catch(e) {}
+    }
+  }, 25000);
+
+  ws.on('pong', () => {}); // keep alive
 
   ws.on('message', (raw) => {
     let msg;
-    try { msg = JSON.parse(raw); } catch { return; }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.type === 'join') {
-      playerLobbyId = msg.lobby || 'public';
+      lobbyId = (msg.lobby || 'public').toLowerCase().substring(0, 20);
       playerName = (msg.name || 'Monkey').substring(0, 16);
-      const lobby = getLobby(playerLobbyId);
+      const lobby = getLobby(lobbyId);
 
       lobby[id] = {
-        ws, name: playerName,
+        ws,
+        name: playerName,
         color: msg.color || 0xff6600,
-        x: 0, y: 1.6, z: 0, yaw: 0
+        x: 0, y: 0, z: 0, yaw: 0
       };
 
-      // Welcome this player
       ws.send(JSON.stringify({ type: 'welcome', id }));
-
-      // Send current state
       ws.send(JSON.stringify({ type: 'state', players: getLobbyState(lobby) }));
-
-      // Notify others
       broadcast(lobby, { type: 'player_join', id, name: playerName, color: msg.color }, id);
 
-      console.log(`[${playerLobbyId}] ${playerName} (${id}) joined — ${Object.keys(lobby).length} players`);
+      console.log(`[${lobbyId}] ${playerName}(${id}) joined — ${Object.keys(lobby).length} players`);
     }
 
-    if (msg.type === 'move' && playerLobbyId) {
-      const lobby = getLobby(playerLobbyId);
+    if (msg.type === 'move' && lobbyId) {
+      const lobby = getLobby(lobbyId);
       if (lobby[id]) {
-        lobby[id].x = msg.x || 0;
-        lobby[id].y = msg.y || 1.6;
-        lobby[id].z = msg.z || 0;
-        lobby[id].yaw = msg.yaw || 0;
+        lobby[id].x   = typeof msg.x   === 'number' ? msg.x   : 0;
+        lobby[id].y   = typeof msg.y   === 'number' ? msg.y   : 0;
+        lobby[id].z   = typeof msg.z   === 'number' ? msg.z   : 0;
+        lobby[id].yaw = typeof msg.yaw === 'number' ? msg.yaw : 0;
         if (msg.name) lobby[id].name = msg.name.substring(0, 16);
-        broadcast(lobby, { type: 'player_move', id, ...msg }, id);
+        broadcast(lobby, { type: 'player_move', id, x: lobby[id].x, y: lobby[id].y, z: lobby[id].z, yaw: lobby[id].yaw, name: lobby[id].name, color: lobby[id].color }, id);
       }
     }
   });
 
   ws.on('close', () => {
-    if (!playerLobbyId) return;
-    const lobby = getLobby(playerLobbyId);
+    clearInterval(pingInterval);
+    if (!lobbyId) return;
+    const lobby = getLobby(lobbyId);
     if (lobby[id]) {
       broadcast(lobby, { type: 'player_leave', id, name: playerName });
       delete lobby[id];
-      console.log(`[${playerLobbyId}] ${playerName} (${id}) left — ${Object.keys(lobby).length} players`);
-      if (Object.keys(lobby).length === 0) delete lobbies[playerLobbyId];
+      console.log(`[${lobbyId}] ${playerName}(${id}) left — ${Object.keys(lobby).length} players`);
+      if (Object.keys(lobby).length === 0) delete lobbies[lobbyId];
     }
+  });
+
+  ws.on('error', (err) => {
+    console.error(`Client ${id} error:`, err.message);
   });
 });
 
-server.listen(PORT, () => console.log(`Monkey Tag WS server on port ${PORT}`));
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Monkey Tag server listening on 0.0.0.0:${PORT}`);
+});
+
+// Log active lobbies every 60s
+setInterval(() => {
+  const total = Object.values(lobbies).reduce((s, l) => s + Object.keys(l).length, 0);
+  if (total > 0) console.log(`Active: ${total} players across ${Object.keys(lobbies).length} lobbies`);
+}, 60000);
