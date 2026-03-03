@@ -78,9 +78,11 @@ wss.on("connection", (ws) => {
         const code = generateCode();
         const name = (msg.lobbyName || "Monkey Lobby").substring(0, 30);
         const isPrivate = !!msg.isPrivate;
+        const mapId = ["baseplate","parkour","hangout"].includes(msg.mapId) ? msg.mapId : "baseplate";
         lobbies.set(code, {
           name,
           isPrivate,
+          mapId,
           players: new Map(),
           host: id,
         });
@@ -92,7 +94,7 @@ wss.on("connection", (ws) => {
           name: client.name,
           color: client.color,
           x: 0, y: 1, z: 0,
-          rx: 0, ry: 0,
+          rx: 0, ry: 0, hp: 100,
         });
         ws.send(JSON.stringify({
           type: "lobby_joined",
@@ -102,6 +104,7 @@ wss.on("connection", (ws) => {
           players: getLobbyPlayerList(code),
           lobbyName: name,
           isPrivate,
+          mapId,
         }));
         break;
       }
@@ -130,6 +133,7 @@ wss.on("connection", (ws) => {
           players: getLobbyPlayerList(code),
           lobbyName: lobby.name,
           isPrivate: lobby.isPrivate,
+          mapId: lobby.mapId || "baseplate",
         }));
         broadcast(code, {
           type: "player_joined",
